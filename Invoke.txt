@@ -1,0 +1,410 @@
+<#
+.SYNOPSIS
+    PGP file exchange with a customer: send (double Base64 -> gzip -> encrypt, armored .asc) and receive (decrypt -> unwrap).
+
+.DESCRIPTION
+    Actions:
+      Check            Reports which gpg (2.2+) the script will use, its version, passphrase mode and keyring folder.
+                       Search order: $GpgPath, PATH, Gpg4win, then the gpg.exe bundled with Git for Windows.
+                       This script never installs anything.
+      NewKeyPair       One-time. Generates your keypair ($KeyAlgorithm: Ed25519 signing + Cv25519 encryption subkey by
+                       default, or RSA-4096), prompting for a passphrase. Exports your
+                       public key to $MyPublicKeyExportPath for the customer, and prints your fingerprint to paste
+                       into the config block.
+      ExportPublicKey  Re-exports your public key (e.g. if the customer loses it).
+      Send             Raw file -> Base64 -> Base64 -> gzip -> gpg encrypt to customer key -> .asc
+      Receive          Customer .asc -> gpg decrypt with your private key -> gunzip -> Base64 decode x2 -> raw file.
+                       Detects each layer, so it still works if a response skips one, and reports what it found.
+
+    Fill in the CONFIGURE block once; after that, calls are just:
+        .\Invoke-DoubleB64Gzip.ps1 Send    .\payload.bin
+        .\Invoke-DoubleB64Gzip.ps1 Receive .\response.asc
+
+    Requires GnuPG 2.2+: Gpg4win, standalone GnuPG, or the gpg bundled with Git for Windows / PortableGit.
+    Passphrases: Gpg4win shows its pinentry window. Git's gpg can't reliably open one from PowerShell, so the script
+    prompts in the console and passes the passphrase to gpg over stdin (loopback); gpg-agent caches it for a while.
+    Works on PowerShell 5.1 and 7+.
+
+    Performance: the public-key algorithm only wraps a 32-byte session key once per file; the file body is AES.
+    Send prefers AES-256 (hardware AES-NI on any modern x86 CPU) among the ciphers the customer key advertises.
+
+.NOTES
+    Send applies --trust-model always to the encrypt call so gpg doesn't stop on the unsigned customer key; the
+    $CustomerFingerprint check is your trust anchor, so get that value from the customer out-of-band.
+    With $EncryptToSelf = $true, outgoing files are also encrypted to your own key. That lets the script decrypt
+    what it just produced and verify the full round trip, and lets you read your own sent files later.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true, Position = 0)]
+    [ValidateSet('Check', 'Send', 'Receive', 'NewKeyPair', 'ExportPublicKey')][string]$Action,
+    [Parameter(Position = 1)][string]$InputPath,
+    [string]$OutputPath,
+
+    # ============================ CONFIGURE ONCE ============================
+    [string]$CustomerPublicKeyPath = 'C:\Keys\customer_pub.asc',
+    [string]$CustomerFingerprint   = '',                              # from the customer, out-of-band (spaces OK)
+    [string]$MyKeyFingerprint      = '',                              # printed by: -Action NewKeyPair
+    [string]$MyPrivateKeyPath      = '',                              # optional: imported if your key isn't in the keyring
+    [string]$MyPublicKeyExportPath = 'C:\Keys\my_pub.asc',            # file you send to the customer
+    [string]$MyUserId              = 'Your Name <you@company.com>',   # used only by NewKeyPair
+    [ValidateSet('Ed25519', 'RSA4096')]
+    [string]$KeyAlgorithm          = 'Ed25519',                       # NewKeyPair 
+only: Ed25519/Cv25519 or RSA-4096
+    [bool]  $EncryptToSelf         = $true,
+    [string]$GpgPath               = '',                              # blank = auto-detect (PATH, Gpg4win, Git)
+    [ValidateSet('Auto', 'Pinentry', 'Prompt')]
+    [string]$PassphraseMode        = 'Auto'                           # Auto: console prompt for Git's gpg, pinentry otherwise
+    # ========================================================================
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+$MinGpgVersion         = [version]'2.2.0'
+
+# ------------------------------------------------------------ gpg locator --
+function Get-GpgVersion([string]$Path) {
+    try { $l = & $Path --version 2>$null | Select-Object -First 1 } catch { return $null }
+    if ("$l" -match '(\d+)\.(\d+)\.(\d+)') { return [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" }
+    return $null
+}
+
+function Get-GitRoots {
+    $roots = New-Object System.Collections.Generic.List[string]
+    $git = Get-Command git -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($git) {
+        # git.exe lives in <root>\cmd, <root>\bin or <root>\mingw64\bin
+        $d = Split-Path -Parent $git.Source
+        foreach ($i in 1..3) {
+            $d = Split-Path -Parent $d
+            if (-not $d) { break }
+            if (Test-Path -LiteralPath (Join-Path $d 'usr\bin\gpg.exe')) { $roots.Add($d); break }
+        }
+    }
+    foreach ($hive in 'HKLM:\SOFTWARE\GitForWindows', 'HKCU:
+\SOFTWARE\GitForWindows') {
+        $p = (Get-ItemProperty -Path $hive -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
+        if ($p) { $roots.Add($p) }
+    }
+    foreach ($p in "$env:ProgramFiles\Git", "$env:LOCALAPPDATA\Programs\Git") { $roots.Add($p) }
+    $roots | Where-Object { $_ } | Select-Object -Unique
+}
+
+function Find-Gpg {
+    $found = New-Object System.Collections.Generic.List[object]
+    $add = {
+        param($p, $src)
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            $full = (Resolve-Path -LiteralPath $p).ProviderPath
+            if (-not ($found | Where-Object { $_.Path -eq $full })) {
+                $found.Add([pscustomobject]@{ Path = $full; Source = $src; Version = (Get-GpgVersion $full) })
+            }
+        }
+    }
+    $onPath = Get-Command gpg -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($onPath) { & $add $onPath.Source 'PATH' }
+    & $add "${env:ProgramFiles(x86)}\GnuPG\bin\gpg.exe" 'Gpg4win'
+    & $add "$env:ProgramFiles\GnuPG\bin\gpg.exe" 'Gpg4win'
+    foreach ($r in Get-GitRoots) { & $add (Join-Path $r 'usr\bin\gpg.exe') "Git ($r)" }
+    return $found
+}
+
+$GpgSource = 'configured'
+$GpgCandidates = @()
+if (-not $GpgPath) {
+    $GpgCandidates = @(Find-Gpg)
+    $pick = $GpgCandidates | Where-Object { $_.Version -and $_.Version -ge $MinGpgVersion } | Select-Object -First 1
+    if ($pick) { $GpgPath = $pick.Path; $GpgSource = $pick.Source }
+}
+if (-not $GpgPath -or -not (Test-Path -LiteralPath $GpgPath)) {
+    $seen = ($GpgCandidates | ForEach-Object { "$($_.Source) v$($_.Version)" }) -join '; '
+    throw "No usable gpg $MinGpgVersion+ found$(if ($seen) { " (found: $seen)" }). Install Git or GnuPG, or set `$GpgPath to gpg.exe."
+}
+
+$UseLoopback = switch ($PassphraseMode) {
+    'Prompt'   { $true }
+    'Pinentry' { $false }
+    default    { $GpgPath -match '[\\/]usr[\\/]bin[\\/]gpg(\.exe)?$' }   # MSYS gpg layout (Git for Windows / PortableGit)
+}
+
+# ---------------------------------------------------------------- helpers --
+$script:Passphrase = $null
+
+function Read-Passphrase([switch]$New) {
+    if ($null -ne $script:Passphrase) { return $script:Passphrase }
+    $prompt = if ($New) { 'New key passphrase' } else { 'Your key passphrase' }
+    $p1 = [Net.NetworkCredential]::new('', (Read-Host -AsSecureString $prompt)).Password
+    if ($New) {
+        if ($p1.Length -lt 8) { throw "Use a passphrase of at least 8 characters." }
+        $p2 = [Net.NetworkCredential]::new('', (Read-Host -AsSecureString 'Repeat passphrase')).Password
+        if ($p1 -cne $p2) { throw "Passphrases didn't match." }
+    }
+    $script:Passphrase = $p1
+    return $p1
+}
+
+function Invoke-GpgRaw([string[]]$GpgArgs, [string]$StdIn) {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'   # gpg writes status to stderr
+    $OutputEncoding = New-Object System.Text.UTF8Encoding($false)         
+# non-ASCII passphrases on PS 5.1
+    try {
+        if ($null -ne $StdIn) { $out = $StdIn | & $GpgPath @GpgArgs 2>&1 | ForEach-Object { "$_" } }
+        else                  { $out = & $GpgPath @GpgArgs 2>&1 | ForEach-Object { "$_" } }
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
+    [pscustomobject]@{ ExitCode = $code; Output = @($out) }
+}
+
+# -NeedPass: the operation uses your private key. In loopback mode, first try without a passphrase (succeeds if
+# gpg-agent has it cached), and only prompt if gpg reports it needs one.
+function Invoke-Gpg {
+    param([string[]]$GpgArgs, [switch]$NeedPass, [switch]$NewPass)
+    if (-not ($NeedPass -and $UseLoopback)) { return Invoke-GpgRaw $GpgArgs $null }
+
+    if (-not $NewPass -and $null -eq $script:Passphrase) {
+        $try = Invoke-GpgRaw (@('--batch', '--pinentry-mode', 'cancel') + $GpgArgs) $null
+        if (($try.Output -join "`n") -notmatch 'cancel|No secret key|passphrase|pinentry') { return $try }
+    }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $pw = Read-Passphrase -New:$NewPass
+        $r = Invoke-GpgRaw (@('--batch', '--pinentry-mode', 'loopback', '--passphrase-fd', '0') + $GpgArgs) $pw
+        if (($r.Output -join "`n") -notmatch 'Bad passphrase') { return $r }
+        $script:Passphrase = $null
+        Write-Warning "Bad passphrase."
+    }
+    throw "Bad passphrase 3 times; giving up."
+}
+
+function Format-Fpr([string]$f) { ($f -replace '\s', '').ToUpperInvariant() }
+
+function Get-KeyIds([string]$Fpr, [switch]$Secret) {
+    $list = if ($Secret) { '--list-secret-keys' } else { '--list-keys' }
+    @((Invoke-Gpg @('--batch', '--with-colons', $list, $Fpr)).Output |
+        Where-Object { $_ -match '^(pub|sub|sec|ssb):' } |
+        ForEach-Object { $_.Split(':')[4].ToUpperInvariant() })
+}
+
+function Test-TempFile([string]$Path) { if ($Path -and (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $Path -Force } }
+function New-TempPath([string]$Ext) { Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N') + $Ext) }
+
+function Confirm-MyKey {
+    if (-not $MyKeyFingerprint) { throw "Set `$MyKeyFingerprint (run -Action NewKeyPair first if you have no key)." }
+    $fpr = Format-Fpr $MyKeyFingerprint
+    if ((Get-KeyIds $fpr -Secret).Count -eq 0) {
+        if (-not $MyPrivateKeyPath) { throw "Your private key $fpr is not in the keyring and `$MyPrivateKeyPath is not set." }
+        $imp = Invoke-Gpg @('--import', (Resolve-Path -LiteralPath $MyPrivateKeyPath).ProviderPath)
+        if ($imp.ExitCode -ne 0 -or (Get-KeyIds $fpr -Secret).Count -eq 0) {
+            throw "Importing your private key failed or fingerprint doesn't match:`n$($imp.Output -join "`n")"
+        }
+    }
+    return $fpr
+}
+
+function Confirm-CustomerKey {
+    $keyFile = (Resolve-Path -LiteralPath $CustomerPublicKeyPath).ProviderPath
+    $show = Invoke-Gpg @('--batch', '--with-colons', '--import-options', 'show-only', '--import', $keyFile)
+    if ($show.ExitCode -ne 0) { throw "gpg could not read the customer key file:`n$($show.Output -join "`n")" }
+
+    $pubLines = @($show.Output | Where-Object { $_ -like 'pub:*' })
+    if ($pubLines.Count -ne 1) { throw "Customer key file must contain 
+exactly one key (found $($pubLines.Count))." }
+    $f = $pubLines[0].Split(':')
+    if ($f[1] -eq 'r') { throw "Customer key is REVOKED." }
+    if ($f[1] -eq 'e') { throw "Customer key is EXPIRED." }
+    if ($f[11] -cnotmatch 'E') { throw "Customer key has no usable encryption capability (caps: $($f[11]))." }
+
+    $fpr = $null; $seen = $false
+    foreach ($l in $show.Output) {
+        if ($l -like 'pub:*') { $seen = $true; continue }
+        if ($seen -and $l -like 'fpr:*') { $fpr = $l.Split(':')[9].ToUpperInvariant(); break }
+    }
+    if (-not $fpr) { throw "Could not determine customer key fingerprint." }
+
+    if ($CustomerFingerprint) {
+        if ((Format-Fpr $CustomerFingerprint) -ne $fpr) { throw "Customer fingerprint MISMATCH. Key file: $fpr  Configured: $(Format-Fpr $CustomerFingerprint)" }
+    } else {
+        Write-Warning "`$CustomerFingerprint not set. Confirm with the customer, then set it: $fpr"
+    }
+
+    $imp = Invoke-Gpg @('--batch', '--import', $keyFile)
+    if ($imp.ExitCode -ne 0) { throw "Customer key import failed:`n$($imp.Output -join "`n")" }
+    return $fpr
+}
+
+function Compress-Gzip([byte[]]$Data) {
+    $ms = New-Object System.IO.MemoryStream
+    $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+    try { $gz.Write($Data, 0, $Data.Length) } finally { $gz.Dispose() }
+    return ,$ms.ToArray()
+}
+
+function Expand-Gzip([byte[]]$Data) {
+    $in  = New-Object System.IO.MemoryStream(, $Data)
+    $gz  = New-Object System.IO.Compression.GZipStream($in, [System.IO.Compression.CompressionMode]::Decompress)
+    $out = New-Object System.IO.MemoryStream
+    try { $gz.CopyTo($out) } finally { $gz.Dispose() }
+    return ,$out.ToArray()
+}
+
+# Peels gzip (if present) then up to two Base64 layers; returns data + list of layers removed.
+function Expand-Payload([byte[]]$Data) {
+    $stages = New-Object System.Collections.Generic.List[string]
+    if ($Data.Length -ge 2 -and $Data[0] -eq 0x1F -and $Data[1] -eq 0x8B) { $Data = Expand-Gzip $Data; $stages.Add('gunzip') }
+    for ($i = 0; $i -lt 2; $i++) {
+        $txt = [System.Text.Encoding]::ASCII.GetString($Data) -replace '\s', ''
+        if ($txt.Length -eq 0 -or $txt.Length % 4 -ne 0 -or $txt -notmatch '^[A-Za-z0-9+/]+={0,2}$') { break }
+        try { $Data = [Convert]::FromBase64String($txt); $stages.Add('base64') } catch { break }
+    }
+    [pscustomobject]@{ Data = $Data; Stages = $stages.ToArray() }
+}
+
+function Export-MyPublicKey([string]$Fpr) {
+    $dir = Split-Path -Parent $MyPublicKeyExportPath
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    $exp = Invoke-Gpg @('--batch', '--yes', '--armor', '--output', $MyPublicKeyExportPath, '--export', $Fpr)
+    if ($exp.ExitCode -ne 0 -or -not (Test-Path $MyPublicKeyExportPath)) { throw "Public key export failed:`n$($exp.Output -join "`n")" }
+}
+
+# ---------------------------------------------------------------- actions --
+switch ($Action) {
+
+    'Check' {
+        $homeLine = (Invoke-GpgRaw @('--version') $null).Output | Where-Object { $_ -like 'Home:*' } | Select-Object -First 1
+        [pscustomobject]@{
+            Using          = $GpgPath
+            Source         = $GpgSource
+            Version        = (Get-GpgVersion $GpgPath)
+            PassphraseMode = $(if ($UseLoopback) { 'console prompt (loopback)' } else { 'pinentry window' })
+            KeyringDir     = ("$homeLine" -replace '^Home:\s*', '')
+            AllFound       = (($GpgCandidates | ForEach-Object { "$($_.Source) v$($_.Version)" }) -join '; ')
+        }
+    }
+
+    'NewKeyPair' {
+        if ($MyUserId -like '*you@company.com*') { throw "Set `$MyUserId to your name and email first." }
+        $algs = if ($KeyAlgorithm -eq 'Ed25519') { @{ Primary = 'ed25519'; Sub = 'cv25519' } } else { @{ Primary = 'rsa4096'; Sub = 'rsa4096' } }
+        Write-Host "Generating $KeyAlgorithm key for $MyUserId."
+        $gen = Invoke-Gpg @('--status-fd', '1', '--quick-generate-key', $MyUserId, $algs.Primary, 'cert,sign', '2y') -NeedPass -NewPass
+        $m = [regex]::Match(($gen.Output -join "`n"), 'KEY_CREATED \w ([0-9A-F]{40})')
+        if ($gen.ExitCode -ne 0 -or -not $m.Success) { throw "Key generation failed:`n$($gen.Output -join "`n")" }
+        $fpr = $m.Groups[1].Value
+
+        $sub = Invoke-Gpg @('--quick-add-key', $fpr, $algs.Sub, 'encr', '2y') -NeedPass
+        if ($sub.ExitCode -ne 0) { throw "Adding encryption subkey failed:`n$($sub.Output -join "`n")" }
+
+        Export-MyPublicKey $fpr
+        [pscustomobject]@{
+            MyKeyFingerprint = $fpr
+            PublicKeyFile    = $MyPublicKeyExportPath
+            Expires          = '2 years (extend with: gpg --quick-set-expire <fpr> 2y)'
+            NextSteps        = "1) Paste fingerprint into `$MyKeyFingerprint. 2) Send $MyPublicKeyExportPath to the customer and read them the fingerprint by phone. 3) Back up the private key: & '$GpgPath' --armor --output mykey_PRIVATE.asc --export-secret-keys $fpr (store it securely)."
+        }
+    }
+
+    'ExportPublicKey' {
+        $fpr = Confirm-MyKey
+        Export-MyPublicKey $fpr
+        [pscustomobject]@{ MyKeyFingerprint = $fpr; PublicKeyFile = $MyPublicKeyExportPath }
+    }
+
+    'Send' {
+        if (-not $InputPath) { throw "Send needs an input file." }
+        $inFile = (Resolve-Path -LiteralPath $InputPath).ProviderPath
+        $base   = [System.IO.Path]::GetFileNameWithoutExtension($inFile)
+        if (-not $OutputPath) { $OutputPath = Join-Path (Split-Path -Parent $inFile) ($base + '.gz.asc') }
+
+        $custFpr = Confirm-CustomerKey
+        $selfFpr = $null
+        if ($EncryptToSelf) {
+            if ($MyKeyFingerprint) { $selfFpr = Confirm-MyKey }
+            else { Write-Warning "`$EncryptToSelf is on but `$MyKeyFingerprint isn't set; skipping self-encryption and full round-trip check." }
+        }
+
+        $raw     = [System.IO.File]::ReadAllBytes($inFile)
+        $pass1   = [Convert]::ToBase64String($raw)
+        $pass2   = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pass1))
+        $gzBytes = Compress-Gzip ([System.Text.Encoding]::ASCII.GetBytes($pass2))
+
+        $chk = Expand-Payload $gzBytes
+        if ([Convert]::ToBase64String($chk.Data) -ne $pass1) { throw 
+"Pre-encryption round-trip check FAILED." }
+
+        $tmp = New-TempPath '.gz'; $tmpDec = $null
+        try {
+            [System.IO.File]::WriteAllBytes($tmp, $gzBytes)
+            $encArgs = @('--batch', '--yes', '--trust-model', 'always', '--compress-algo', 'none', '--armor',
+                         '--personal-cipher-preferences', 'AES256 AES192 AES',
+                         '--set-filename', ($base + '.gz'), '--recipient', $custFpr)
+            if ($selfFpr) { $encArgs += @('--recipient', $selfFpr) }
+            $encArgs += @('--output', $OutputPath, '--encrypt', $tmp)
+            $enc = Invoke-Gpg $encArgs
+            if ($enc.ExitCode -ne 0 -or -not (Test-Path $OutputPath)) { throw "Encryption failed:`n$($enc.Output -join "`n")" }
+
+            # Confirm customer key is among recipients
+            $pkt    = (Invoke-Gpg @('--batch', '--list-packets', '--pinentry-mode', 'cancel', $OutputPath)).Output -join "`n"
+            $pktIds = @([regex]::Matches($pkt, 'keyid ([0-9A-Fa-f]{16})') | ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() })
+            $custIds = Get-KeyIds $custFpr
+            if (-not ($pktIds | Where-Object { $custIds -contains $_ })) { throw "Output is not encrypted to the customer key (packet IDs: $($pktIds -join ', '))." }
+
+            # Full round trip through our own key
+            $roundTrip = 'skipped (no self key)'
+            if ($selfFpr) {
+                $tmpDec = New-TempPath '.dec'
+                $dec = Invoke-Gpg @('--yes', '--output', $tmpDec, '--decrypt', $OutputPath) -NeedPass
+                if ($dec.ExitCode -ne 0) { throw "Self-decrypt check failed:`n$($dec.Output -join "`n")" }
+                $back = Expand-Payload ([System.IO.File]::ReadAllBytes($tmpDec))
+                if ([Convert]::ToBase64String($back.Data) -ne $pass1) { throw "Full round-trip check FAILED." }
+                $roundTrip = 'OK (' + ($back.Stages -join ' > ') + ')'
+            }
+        } finally { Test-TempFile $tmp; Test-TempFile $tmpDec }
+
+        [pscustomobject]@{
+            Output          = $OutputPath
+            CustomerKey     = $custFpr
+            EncryptedToSelf = [bool]$selfFpr
+            InputBytes      = $raw.Length
+            OutputBytes     = (Get-Item -LiteralPath $OutputPath).Length
+            RecipientCheck  = 'OK'
+            RoundTrip       = $roundTrip
+        }
+    }
+
+    'Receive' {
+        if (-not $InputPath) { throw "Receive needs the customer's encrypted file." }
+        $inFile = (Resolve-Path -LiteralPath $InputPath).ProviderPath
+        if (-not $OutputPath) {
+            $stem = [System.IO.Path]::GetFileName($inFile) -replace '(\.(asc|gpg|pgp))$', '' -replace '\.gz$', ''
+            $OutputPath = Join-Path (Split-Path -Parent $inFile) ($stem + '.decrypted')
+        }
+
+        $myFpr = Confirm-MyKey
+        $tmp = New-TempPath '.dec'
+        try {
+            $dec = Invoke-Gpg @('--yes', '--status-fd', '1', '--output', $tmp, '--decrypt', $inFile) -NeedPass
+            $status = $dec.Output -join "`n"
+            if ($dec.ExitCode -ne 0 -and $status -notmatch 'DECRYPTION_OKAY') { throw "Decryption failed:`n$status" }
+
+            $encTo = @([regex]::Matches($status, 'ENC_TO ([0-9A-F]{16})') | ForEach-Object { $_.Groups[1].Value })
+            $mine  = Get-KeyIds $myFpr
+            if (-not ($encTo | Where-Object { $mine -contains $_ })) { Write-Warning "File wasn't addressed to your configured key (ENC_TO: $($encTo -join ', '))." }
+
+            $sig = 'unsigned'
+            if     ($status -match 'GOODSIG \S+ (.+)') { $sig = "GOOD signature: $($Matches[1])" }
+            elseif ($status -match 'BADSIG')           { $sig = 'BAD SIGNATURE (file altered or wrong key)' }
+            elseif ($status -match 'NO_PUBKEY|ERRSIG') { $sig = "signed, but signer's key not in keyring" }
+
+            $res = Expand-Payload ([System.IO.File]::ReadAllBytes($tmp))
+            [System.IO.File]::WriteAllBytes($OutputPath, $res.Data)
+        } finally { Test-TempFile $tmp }
+
+        $layers = $res.Stages -join ' > '
+        if ($layers -ne 'gunzip > base64 > base64') { Write-Warning "Unexpected layering: '$layers'. Check the output before relying on it." }
+
+        [pscustomobject]@{
+            Output      = $OutputPath
+            OutputBytes = $res.Data.Length
+            Layers      = $layers
+            Signature   = $sig
+        }
+    }
+}
