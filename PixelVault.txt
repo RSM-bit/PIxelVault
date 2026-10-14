@@ -1,0 +1,288 @@
+#Requires -Version 7.4
+<#
+.SYNOPSIS
+  Pack any file (e.g. a PGP .asc) into a noise-looking PNG, under an independent AES-256-GCM layer by default, and unpack it again.
+
+.DESCRIPTION
+  ConvertTo-PixelVault   file  -> PNG (or base64 text of the PNG with -Base64)
+  ConvertFrom-PixelVault PNG / base64 text -> original file (original filename restored, SHA-256 verified)
+
+  Container (stored in the RGB pixel bytes, row-major, rest of the image filled with CSPRNG noise):
+    ver(1) | flags(1) | pbkdf2Iter(4) | salt(16) | nonce(12) | bodyLen(4)   <- 38-byte header, authenticated as GCM AAD
+    tag(16) | body(bodyLen)
+  body = AES-256-GCM( nameLen(2) | utf8 name | sha256(32) | file bytes ), key = PBKDF2-HMAC-SHA256(passphrase, salt, iter)
+  With -NoEncryption the body is stored in the clear (obfuscation only).
+
+  Output is lossless PNG on purpose: JPEG is lossy and would destroy the payload. Store the images as plain files
+  (Drive/OneDrive/S3), never in a photo service that recompresses or strips images.
+
+.EXAMPLE
+  . .\PixelVault.ps1
+  ConvertTo-PixelVault -Path .\secrets.asc            # -> IMG_20261009_140612_347.png (save-time name) in the same folder
+  ConvertFrom-PixelVault -Path .\IMG_20261009_140612_347.png   # restores secrets.asc next to the image
+#>
+
+Set-StrictMode -Version Latest
+
+if (-not ('PixelVault.Crc32' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace PixelVault {
+  public static class Crc32 {
+    static readonly uint[] T = Build();
+    static uint[] Build() {
+      var t = new uint[256];
+      for (uint n = 0; n < 256; n++) {
+        uint c = n;
+        for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        t[n] = c;
+      }
+      return t;
+    }
+    public static uint Compute(byte[] a, byte[] b) {
+      uint c = 0xFFFFFFFFu;
+      foreach (var x in a) c = T[(c ^ x) & 0xFF] ^ (c >> 8);
+      foreach (var x in b) c = T[(c ^ x) & 0xFF] ^ (c >> 8);
+      return c ^ 0xFFFFFFFFu;
+    }
+  }
+}
+'@
+}
+
+$script:PngSig = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+$script:HeaderLen = 38
+$script:TagLen = 16
+
+function Get-BEBytes([uint32]$Value) {
+    $b = [BitConverter]::GetBytes($Value)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($b) }
+    , $b
+}
+
+function Read-BEUInt32([byte[]]$Buf, [int]$Offset) {
+    $t = [byte[]]::new(4)
+    [Buffer]::BlockCopy($Buf, $Offset, $t, 0, 4)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($t) }
+    [BitConverter]::ToUInt32($t, 0)
+}
+
+function Read-LEUInt([byte[]]$Buf, [int]$Offset, [int]$Count) {
+    # Little-endian read independent of host byte order (matches BinaryWriter, which always writes little-endian)
+    [uint64]$v = 0
+    for ($i = $Count - 1; $i -ge 0; $i--) { $v = ($v -shl 8) -bor $Buf[$Offset + $i] }
+    $v
+}
+
+function Get-Slice([byte[]]$Buf, [int]$Offset, [int]$Count) {
+    $r = [byte[]]::new($Count)
+    [Buffer]::BlockCopy($Buf, $Offset, $r, 0, $Count)
+    , $r
+}
+
+function Write-PngChunk([System.IO.Stream]$Stream, [string]$Type, [byte[]]$Data) {
+    $tb = [Text.Encoding]::ASCII.GetBytes($Type)
+    $Stream.Write((Get-BEBytes $Data.Length), 0, 4)
+    $Stream.Write($tb, 0, 4)
+    if ($Data.Length) { $Stream.Write($Data, 0, $Data.Length) }
+    $Stream.Write((Get-BEBytes ([PixelVault.Crc32]::Compute($tb, $Data))), 0, 4)
+}
+
+function Get-PassBytes([securestring]$Pass, [switch]$Confirm) {
+    if (-not $Pass) {
+        $Pass = Read-Host 'Passphrase' -AsSecureString
+        if ($Confirm) {
+            $again = Read-Host 'Confirm passphrase' -AsSecureString
+            if ((ConvertFrom-SecureString $Pass -AsPlainText) -cne (ConvertFrom-SecureString $again -AsPlainText)) { throw 'Passphrases do not match.' }
+        }
+    }
+    $b = [Text.Encoding]::UTF8.GetBytes((ConvertFrom-SecureString $Pass -AsPlainText))
+    if ($b.Length -eq 0) { throw 'Empty passphrase.' }
+    , $b
+}
+
+function Get-Key([byte[]]$Pass, [byte[]]$Salt, [int]$Iterations) {
+    [Security.Cryptography.Rfc2898DeriveBytes]::Pbkdf2($Pass, $Salt, $Iterations, [Security.Cryptography.HashAlgorithmName]::SHA256, 32)
+}
+
+function New-PixelVaultName([string]$Directory, [string]$Extension, [string]$Prefix = 'IMG_') {
+    # Camera-style name from the save time, e.g. IMG_20261009_140612_347.png; bumps forward on collision
+    $t = Get-Date
+    do {
+        $candidate = Join-Path $Directory ('{0}{1:yyyyMMdd_HHmmss_fff}{2}' -f $Prefix, $t, $Extension)
+        $t = $t.AddMilliseconds(1)
+    } while (Test-Path -LiteralPath $candidate)
+    $candidate
+}
+
+function ConvertTo-PixelVault {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)][Alias('FullName')][string]$Path,
+        [string]$OutFile,
+        [securestring]$Passphrase,
+        [switch]$NoEncryption,
+        [switch]$Base64,
+        [string]$NamePrefix = 'IMG_',   # used only when -OutFile is omitted
+        [ValidateRange(100000, 10000000)][int]$Iterations = 600000,
+        [switch]$Force
+    )
+    begin { $ErrorActionPreference = 'Stop' }
+    process {
+        $src = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
+        $data = [IO.File]::ReadAllBytes($src)
+        $name = [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFileName($src))
+
+        # inner = nameLen | name | sha256 | data
+        $ims = [IO.MemoryStream]::new(); $iw = [IO.BinaryWriter]::new($ims)
+        $iw.Write([uint16]$name.Length); $iw.Write($name)
+        $iw.Write([Security.Cryptography.SHA256]::HashData($data)); $iw.Write($data); $iw.Flush()
+        $inner = $ims.ToArray()
+
+        $encrypt = -not $NoEncryption
+        [byte[]]$salt  = if ($encrypt) { [Security.Cryptography.RandomNumberGenerator]::GetBytes(16) } else { [byte[]]::new(16) }
+        [byte[]]$nonce = if ($encrypt) { [Security.Cryptography.RandomNumberGenerator]::GetBytes(12) } else { [byte[]]::new(12) }
+        $tag = [byte[]]::new($script:TagLen)
+
+        $hms = [IO.MemoryStream]::new(); $hw = [IO.BinaryWriter]::new($hms)
+        $hw.Write([byte]1); $hw.Write([byte]([int]$encrypt)); $hw.Write([int32]$(if ($encrypt) { $Iterations } else { 0 }))
+        $hw.Write($salt); $hw.Write($nonce); $hw.Write([int32]$inner.Length); $hw.Flush()
+        $header = $hms.ToArray()
+
+        if ($encrypt) {
+            $pw = Get-PassBytes $Passphrase -Confirm
+            $key = Get-Key $pw $salt $Iterations
+            $body = [byte[]]::new($inner.Length)
+            $gcm = [Security.Cryptography.AesGcm]::new($key, $script:TagLen)
+            try { $gcm.Encrypt($nonce, $inner, $body, $tag, $header) }
+            finally { $gcm.Dispose(); [Array]::Clear($key, 0, $key.Length); [Array]::Clear($pw, 0, $pw.Length); [Array]::Clear($inner, 0, $inner.Length) }
+        } else {
+            $body = $inner
+        }
+
+        # Lay the container into an RGB canvas; unused tail is CSPRNG noise
+        $payloadLen = $script:HeaderLen + $script:TagLen + $body.Length
+        $pixels = [math]::Ceiling($payloadLen / 3)
+        $width  = [int][math]::Ceiling([math]::Sqrt($pixels))
+        $height = [int][math]::Ceiling($pixels / $width)
+        $rowBytes = $width * 3
+        $canvas = [Security.Cryptography.RandomNumberGenerator]::GetBytes($rowBytes * $height)
+        [Buffer]::BlockCopy($header, 0, $canvas, 0, $script:HeaderLen)
+        [Buffer]::BlockCopy($tag, 0, $canvas, $script:HeaderLen, $script:TagLen)
+        [Buffer]::BlockCopy($body, 0, $canvas, $script:HeaderLen + $script:TagLen, $body.Length)
+
+        # Scanlines with filter type 0 (None)
+        $raw = [byte[]]::new(($rowBytes + 1) * $height)
+        for ($r = 0; $r -lt $height; $r++) { [Buffer]::BlockCopy($canvas, $r * $rowBytes, $raw, $r * ($rowBytes + 1) + 1, $rowBytes) }
+        $zms = [IO.MemoryStream]::new()
+        $z = [IO.Compression.ZLibStream]::new($zms, [IO.Compression.CompressionLevel]::Optimal, $true)
+        $z.Write($raw, 0, $raw.Length); $z.Dispose()
+
+        $png = [IO.MemoryStream]::new()
+        $png.Write($script:PngSig, 0, 8)
+        Write-PngChunk $png 'IHDR' ([byte[]]((Get-BEBytes $width) + (Get-BEBytes $height) + [byte[]](8, 2, 0, 0, 0)))
+        Write-PngChunk $png 'IDAT' $zms.ToArray()
+        Write-PngChunk $png 'IEND' ([byte[]]::new(0))
+
+        $dest = if ($OutFile) { $OutFile } else { New-PixelVaultName ([IO.Path]::GetDirectoryName($src)) $(if ($Base64) { '.png.b64' } else { '.png' }) $NamePrefix }
+        $dest = [IO.Path]::GetFullPath($dest, (Get-Location).ProviderPath)
+        if ((Test-Path -LiteralPath $dest) -and -not $Force) { throw "$dest exists; use -Force to overwrite." }
+        if ($Base64) { [IO.File]::WriteAllText($dest, [Convert]::ToBase64String($png.ToArray(), 'InsertLineBreaks')) }
+        else { [IO.File]::WriteAllBytes($dest, $png.ToArray()) }
+        Get-Item -LiteralPath $dest
+    }
+}
+
+function ConvertFrom-PixelVault {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)][Alias('FullName')][string]$Path,
+        [string]$OutFile,          # default: original filename, in the image's folder
+        [securestring]$Passphrase,
+        [switch]$Force
+    )
+    begin { $ErrorActionPreference = 'Stop' }
+    process {
+        $src = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
+        $bytes = [IO.File]::ReadAllBytes($src)
+        $sigHex = [Convert]::ToHexString($script:PngSig)
+        if ($bytes.Length -lt 8 -or [Convert]::ToHexString($bytes, 0, 8) -ne $sigHex) {
+            try { $bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($src)) } catch { throw 'Not a PNG or base64-encoded PNG.' }
+            if ($bytes.Length -lt 8 -or [Convert]::ToHexString($bytes, 0, 8) -ne $sigHex) { throw 'Base64 content is not a PNG.' }
+        }
+
+        # Walk chunks
+        $pos = 8; $width = 0; $height = 0; $done = $false
+        $idat = [IO.MemoryStream]::new()
+        while (-not $done -and $pos + 8 -le $bytes.Length) {
+            $len = [int](Read-BEUInt32 $bytes $pos)
+            $type = [Text.Encoding]::ASCII.GetString($bytes, $pos + 4, 4)
+            $off = $pos + 8
+            if ($off + $len + 4 -gt $bytes.Length) { throw 'Truncated PNG.' }
+            switch ($type) {
+                'IHDR' {
+                    $width = [int](Read-BEUInt32 $bytes $off); $height = [int](Read-BEUInt32 $bytes ($off + 4))
+                    if ($bytes[$off + 8] -ne 8 -or $bytes[$off + 9] -ne 2 -or $bytes[$off + 12] -ne 0) { throw 'Not a PixelVault image (unexpected PNG format; was it re-saved?).' }
+                }
+                'IDAT' { $idat.Write($bytes, $off, $len) }
+                'IEND' { $done = $true }
+            }
+            $pos = $off + $len + 4
+        }
+        if ($width -le 0 -or $height -le 0) { throw 'Missing IHDR.' }
+
+        $idat.Position = 0
+        $z = [IO.Compression.ZLibStream]::new($idat, [IO.Compression.CompressionMode]::Decompress)
+        $rms = [IO.MemoryStream]::new(); $z.CopyTo($rms); $z.Dispose()
+        $raw = $rms.ToArray()
+        $rowBytes = $width * 3
+        if ($raw.Length -lt ($rowBytes + 1) * $height) { throw 'Pixel data truncated.' }
+
+        $canvas = [byte[]]::new($rowBytes * $height)
+        for ($r = 0; $r -lt $height; $r++) {
+            $o = $r * ($rowBytes + 1)
+            if ($raw[$o] -ne 0) { throw 'Image uses PNG row filters this tool never writes; it was re-encoded by another program.' }
+            [Buffer]::BlockCopy($raw, $o + 1, $canvas, $r * $rowBytes, $rowBytes)
+        }
+
+        # Parse container
+        if ($canvas[0] -ne 1) { throw "Unsupported container version $($canvas[0])." }
+        $encrypted = ($canvas[1] -band 1) -eq 1
+        $iter = [int](Read-LEUInt $canvas 2 4)
+        $salt = Get-Slice $canvas 6 16
+        $nonce = Get-Slice $canvas 22 12
+        $bodyLen = [int](Read-LEUInt $canvas 34 4)
+        $start = $script:HeaderLen + $script:TagLen
+        if ($bodyLen -lt 34 -or $start + $bodyLen -gt $canvas.Length) { throw 'Corrupt container (bad length).' }
+        $header = Get-Slice $canvas 0 $script:HeaderLen
+        $tag = Get-Slice $canvas $script:HeaderLen $script:TagLen
+        $body = Get-Slice $canvas $start $bodyLen
+
+        if ($encrypted) {
+            if ($iter -lt 100000 -or $iter -gt 10000000) { throw 'Corrupt container (bad KDF parameters).' }
+            $pw = Get-PassBytes $Passphrase
+            $key = Get-Key $pw $salt $iter
+            $inner = [byte[]]::new($bodyLen)
+            $gcm = [Security.Cryptography.AesGcm]::new($key, $script:TagLen)
+            try { $gcm.Decrypt($nonce, $body, $tag, $inner, $header) }
+            catch { throw 'Authentication failed: wrong passphrase or image altered.' }
+            finally { $gcm.Dispose(); [Array]::Clear($key, 0, $key.Length); [Array]::Clear($pw, 0, $pw.Length) }
+        } else {
+            $inner = $body
+        }
+
+        $nameLen = [int](Read-LEUInt $inner 0 2)
+        if (2 + $nameLen + 32 -gt $inner.Length) { throw 'Corrupt payload.' }
+        $name = [IO.Path]::GetFileName([Text.Encoding]::UTF8.GetString($inner, 2, $nameLen))   # strips any path components
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = 'restored.bin' }
+        $hash = Get-Slice $inner (2 + $nameLen) 32
+        $dataOff = 2 + $nameLen + 32
+        $data = Get-Slice $inner $dataOff ($inner.Length - $dataOff)
+        if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($data)) -ne [Convert]::ToHexString($hash)) { throw 'SHA-256 mismatch: payload corrupted.' }
+
+        $dest = if ($OutFile) { $OutFile } else { Join-Path ([IO.Path]::GetDirectoryName($src)) $name }
+        $dest = [IO.Path]::GetFullPath($dest, (Get-Location).ProviderPath)
+        if ((Test-Path -LiteralPath $dest) -and -not $Force) { throw "$dest exists; use -Force to overwrite or -OutFile to redirect." }
+        [IO.File]::WriteAllBytes($dest, $data)
+        Get-Item -LiteralPath $dest
+    }
+}

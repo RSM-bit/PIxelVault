@@ -1,0 +1,123 @@
+#Requires -Version 7
+<#
+.SYNOPSIS
+  Create an OpenPGP key set the "offline primary" way: a certify-only Ed25519 primary key plus separate sign / encrypt / auth subkeys, with every backup file written to one folder.
+
+.DESCRIPTION
+  Run this on YOUR machine (ideally one that is offline, or a Tails/live USB). gpg asks for the passphrase through its own pinentry window; the script never sees, stores, or logs it.
+
+  Output in -OutDir (fingerprint-prefixed):
+    <FPR>.public.asc            public key - the only file you distribute
+    <FPR>.secret-FULL.asc       primary + subkeys, passphrase-protected  -> offline backup (USB x2 / paper), NEVER cloud
+    <FPR>.secret-subkeys.asc    subkeys only                              -> what day-to-day machines import
+    <FPR>.revoke.asc            revocation certificate                    -> store apart from the secret backup
+    <FPR>.fingerprint.txt       full fingerprint, grouped for reading aloud / printing
+
+  -RemovePrimary then deletes the primary secret key from this keyring and keeps only the subkeys, so a compromise of this machine can't mint new subkeys or certify other keys.
+
+.EXAMPLE
+  .\New-GpgKeySet.ps1 -Name 'Bear Sunderland' -Email 'you@example.com' -OutDir E:\keys
+.EXAMPLE
+  # Build in an isolated keyring on a USB stick, leaving the machine's normal keyring untouched
+  .\New-GpgKeySet.ps1 -Name 'Bear Sunderland' -Email 'you@example.com' -OutDir E:\keys -GnuPGHome E:\gnupg -RemovePrimary
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter(Mandatory)][ValidatePattern('^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$')][string]$Email,
+    [Parameter(Mandatory)][string]$OutDir,
+    [string]$Comment,
+    [string]$PrimaryExpire = '5y',    # extendable later with the primary key; expiry is a dead-man switch, not a hard end
+    [string]$SubkeyExpire  = '2y',
+    [string]$GnuPGHome,               # optional isolated keyring directory
+    [switch]$RemovePrimary
+)
+$ErrorActionPreference = 'Stop'
+
+$gpg = (Get-Command gpg -ErrorAction SilentlyContinue).Source
+if (-not $gpg) { throw 'gpg not found. Install GnuPG 2.5.x (Windows: Gpg4win, then the GnuPG 2.5 installer on top).' }
+$gpgArgsBase = @()
+if ($GnuPGHome) {
+    New-Item -ItemType Directory -Force -Path $GnuPGHome | Out-Null
+    $GnuPGHome = (Resolve-Path -LiteralPath $GnuPGHome).ProviderPath
+    $gpgArgsBase += @('--homedir', $GnuPGHome)
+}
+
+function Invoke-Gpg {
+    param([Parameter(ValueFromRemainingArguments)][string[]]$GpgArgs)
+    $out = & $gpg @gpgArgsBase @GpgArgs
+    if ($LASTEXITCODE -ne 0) { throw "gpg $($GpgArgs -join ' ') failed (exit $LASTEXITCODE)." }
+    $out
+}
+
+$verLine = (& $gpg @gpgArgsBase --version | Select-Object -First 1)
+if ($verLine -match '(\d+)\.(\d+)\.(\d+)') {
+    $v = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+    if ($v -lt [version]'2.4.0') { throw "$verLine is too old; install GnuPG 2.5.x." }
+    if ($v -lt [version]'2.5.0') { Write-Warning "$verLine works, but the 2.4 branch is end-of-life. Upgrade to 2.5.x." }
+}
+
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$OutDir = (Resolve-Path -LiteralPath $OutDir).ProviderPath
+
+$uid = if ($Comment) { "$Name ($Comment) <$Email>" } else { "$Name <$Email>" }
+$existing = & $gpg @gpgArgsBase --list-keys --with-colons -- "<$Email>" 2>$null
+if ($LASTEXITCODE -eq 0 -and $existing) { throw "A key for <$Email> already exists in this keyring. Use -GnuPGHome for a clean keyring, or remove the old key first." }
+
+Write-Host "Creating certify-only Ed25519 primary for: $uid" -ForegroundColor Cyan
+Write-Host 'gpg will now ask for a passphrase. Use a long one (6+ random words); it protects every backup file.' -ForegroundColor Yellow
+Invoke-Gpg --batch --quick-generate-key -- $uid ed25519 cert $PrimaryExpire | Out-Null
+
+$fpr = (Invoke-Gpg --list-secret-keys --with-colons -- "<$Email>" |
+        Where-Object { $_ -like 'fpr:*' } | Select-Object -First 1).Split(':')[9]
+if ($fpr -notmatch '^[0-9A-F]{40}$|^[0-9A-F]{64}$') { throw "Could not read the new key's fingerprint." }
+
+Write-Host 'Adding subkeys: ed25519 sign, cv25519 encrypt, ed25519 auth' -ForegroundColor Cyan
+Invoke-Gpg --batch --quick-add-key $fpr ed25519 sign $SubkeyExpire | Out-Null
+Invoke-Gpg --batch --quick-add-key $fpr cv25519 encr $SubkeyExpire | Out-Null
+Invoke-Gpg --batch --quick-add-key $fpr ed25519 auth $SubkeyExpire | Out-Null
+
+$pub  = Join-Path $OutDir "$fpr.public.asc"
+$full = Join-Path $OutDir "$fpr.secret-FULL.asc"
+$subs = Join-Path $OutDir "$fpr.secret-subkeys.asc"
+$rev  = Join-Path $OutDir "$fpr.revoke.asc"
+$fpt  = Join-Path $OutDir "$fpr.fingerprint.txt"
+
+Invoke-Gpg --armor --export-options export-minimal --output $pub --export $fpr | Out-Null
+Invoke-Gpg --armor --output $full --export-secret-keys $fpr | Out-Null
+Invoke-Gpg --armor --output $subs --export-secret-subkeys $fpr | Out-Null
+
+# gpg auto-writes a revocation certificate at key creation; copy it out
+$home_ = if ($GnuPGHome) { $GnuPGHome } else { (& gpgconf --list-dirs homedir) }
+$autoRev = Join-Path $home_ "openpgp-revocs.d/$fpr.rev"
+if (Test-Path -LiteralPath $autoRev) {
+    # gpg prefixes the armor line with ':' so it can't be imported by accident; strip it so it is ready to use
+    (Get-Content -LiteralPath $autoRev -Raw) -replace '(?m)^:-----BEGIN', '-----BEGIN' | Set-Content -LiteralPath $rev -NoNewline
+} else {
+    Write-Warning "Auto revocation certificate not found at $autoRev. Create one manually: gpg --gen-revoke $fpr"
+}
+
+$grouped = (($fpr -split '(.{4})' | Where-Object { $_ }) -join ' ')
+@"
+OpenPGP key: $uid
+Fingerprint: $grouped
+Created:     $(Get-Date -Format 'yyyy-MM-dd')
+"@ | Set-Content -LiteralPath $fpt
+
+if ($RemovePrimary) {
+    Write-Host 'Removing the primary secret key from this keyring (subkeys stay)...' -ForegroundColor Cyan
+    Invoke-Gpg --batch --yes --delete-secret-keys "$fpr!" | Out-Null
+    $sec = Invoke-Gpg --list-secret-keys --with-colons $fpr
+    if (-not ($sec | Where-Object { $_ -like 'sec:*' } | ForEach-Object { $_.Split(':')[14] -eq '#' })) {
+        throw 'Primary secret key still present; check the keyring manually.'
+    }
+}
+
+Write-Host ''
+Invoke-Gpg --list-secret-keys --keyid-format long $fpr | Write-Host
+Write-Host ''
+Write-Host "Fingerprint: $grouped" -ForegroundColor Green
+Write-Host "Files in $OutDir :" -ForegroundColor Green
+Get-ChildItem -LiteralPath $OutDir -Filter "$fpr.*" | ForEach-Object { '  ' + $_.Name } | Write-Host
+Write-Host ''
+Write-Host 'Next: copy secret-FULL + revoke to two offline USB sticks (separate places), print the fingerprint, then wipe them from this machine if it is online.' -ForegroundColor Yellow
